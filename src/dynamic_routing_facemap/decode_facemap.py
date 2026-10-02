@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
+import multiprocessing as mp
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
@@ -449,6 +450,75 @@ def _write_parquet_atomically(frame: pl.DataFrame, output_path: Path) -> None:
     temporary_path.replace(output_path)
 
 
+def _decode_one_session(
+    index: int,
+    session_id: str,
+    trials: pl.DataFrame,
+    trial_metadata: Mapping[str, Mapping[str, Any]],
+    behavior_metadata: Mapping[str, Mapping[str, Any]],
+    *,
+    facemap_table: str,
+    datacube_kwargs: Mapping[str, Any],
+    window: tuple[float, float],
+    features_to_use: int,
+    sampling_rate: float,
+    window_length: int,
+    cv_folds: int,
+    fail_fast: bool,
+    get_lf: Callable[..., pl.LazyFrame],
+) -> dict[str, Any]:
+    """Decode one session in a process-pool worker."""
+
+    LOGGER.info("Decoding session %d: %s", index, session_id)
+    session_trials = trials.filter(pl.col("session_id").eq(session_id))
+    row = _base_result_row(
+        session_id,
+        session_trials,
+        trial_metadata.get(session_id, {}),
+        behavior_metadata.get(session_id, {}),
+        window=window,
+        features_to_use=features_to_use,
+        sampling_rate=sampling_rate,
+        window_length=window_length,
+        cv_folds=cv_folds,
+    )
+
+    try:
+        facemap_lf = get_lf(
+            facemap_table,
+            session_id=session_id,
+            **datacube_kwargs,
+        )
+        row.update(
+            decode_session(
+                session_trials,
+                facemap_lf,
+                window=window,
+                features_to_use=features_to_use,
+                sampling_rate=sampling_rate,
+                window_length=window_length,
+                cv_folds=cv_folds,
+            )
+        )
+    except Exception as exc:  # one problematic session should not stop a batch
+        if fail_fast:
+            raise
+        LOGGER.exception("Could not decode session %s", session_id)
+        row.update(
+            status="error",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            cv_scores=None,
+            window_start_s=None,
+            window_end_s=None,
+            window_center_s=None,
+            cv_score_mean=None,
+            cv_score_max=None,
+            best_window_center_s=None,
+        )
+    return row
+
+
 def decode_all_sessions(
     trials_lf: pl.LazyFrame | pl.DataFrame | None = None,
     *,
@@ -500,7 +570,8 @@ def decode_all_sessions(
         ``parallelize_sessions`` is true. If omitted, the executor default is
         used. This option has no effect for sequential decoding.
     get_lf:
-        Dependency-injection hook useful for tests or a local data loader.
+        Dependency-injection hook useful for tests or a local data loader.  A
+        custom loader must be picklable when ``parallelize_sessions`` is true.
     """
 
     datacube_kwargs = {
@@ -548,56 +619,6 @@ def decode_all_sessions(
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be at least one")
 
-    def decode_one(index: int, session_id: str) -> dict[str, Any]:
-        LOGGER.info("Decoding session %d/%d: %s", index, len(session_ids), session_id)
-        session_trials = trials.filter(pl.col("session_id").eq(session_id))
-        row = _base_result_row(
-            session_id,
-            session_trials,
-            trial_metadata.get(session_id, {}),
-            behavior_metadata.get(session_id, {}),
-            window=window,
-            features_to_use=features_to_use,
-            sampling_rate=sampling_rate,
-            window_length=window_length,
-            cv_folds=cv_folds,
-        )
-
-        try:
-            facemap_lf = get_lf(
-                facemap_table,
-                session_id=session_id,
-                **datacube_kwargs,
-            )
-            row.update(
-                decode_session(
-                    session_trials,
-                    facemap_lf,
-                    window=window,
-                    features_to_use=features_to_use,
-                    sampling_rate=sampling_rate,
-                    window_length=window_length,
-                    cv_folds=cv_folds,
-                )
-            )
-        except Exception as exc:  # one problematic session should not stop a batch
-            if fail_fast:
-                raise
-            LOGGER.exception("Could not decode session %s", session_id)
-            row.update(
-                status="error",
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-                cv_scores=None,
-                window_start_s=None,
-                window_end_s=None,
-                window_center_s=None,
-                cv_score_mean=None,
-                cv_score_max=None,
-                best_window_center_s=None,
-            )
-        return row
-
     rows: list[dict[str, Any] | None] = [None] * len(session_ids)
 
     def save_result(index: int, row: dict[str, Any]) -> None:
@@ -616,9 +637,32 @@ def decode_all_sessions(
         file=sys.stdout,
     ) as progress:
         if parallelize_sessions:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Polars uses native threads and must not be forked on Unix.  The
+            # explicit spawn context is required on Linux, whose default is
+            # fork.  The worker is module-level so it is picklable by spawn.
+            spawn_context = mp.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=spawn_context,
+            ) as executor:
                 futures = {
-                    executor.submit(decode_one, index, session_id): (index, session_id)
+                    executor.submit(
+                        _decode_one_session,
+                        index,
+                        session_id,
+                        trials,
+                        trial_metadata,
+                        behavior_metadata,
+                        facemap_table=facemap_table,
+                        datacube_kwargs=datacube_kwargs,
+                        window=window,
+                        features_to_use=features_to_use,
+                        sampling_rate=sampling_rate,
+                        window_length=window_length,
+                        cv_folds=cv_folds,
+                        fail_fast=fail_fast,
+                        get_lf=get_lf,
+                    ): (index, session_id)
                     for index, session_id in enumerate(session_ids, start=1)
                 }
                 try:
@@ -632,7 +676,25 @@ def decode_all_sessions(
                     raise
         else:
             for index, session_id in enumerate(session_ids, start=1):
-                save_result(index, decode_one(index, session_id))
+                save_result(
+                    index,
+                    _decode_one_session(
+                        index,
+                        session_id,
+                        trials,
+                        trial_metadata,
+                        behavior_metadata,
+                        facemap_table=facemap_table,
+                        datacube_kwargs=datacube_kwargs,
+                        window=window,
+                        features_to_use=features_to_use,
+                        sampling_rate=sampling_rate,
+                        window_length=window_length,
+                        cv_folds=cv_folds,
+                        fail_fast=fail_fast,
+                        get_lf=get_lf,
+                    ),
+                )
                 progress.update(1)
 
     result = pl.DataFrame([row for row in rows if row is not None])

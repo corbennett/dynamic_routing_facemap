@@ -43,7 +43,8 @@ Facemap features, 60 Hz sampling, and six-sample sliding windows. Use
 Sessions are decoded sequentially by default. Pass `--parallelize-sessions` to
 decode them concurrently; optionally use `--max-workers N` to limit the number
 of concurrent sessions. A progress bar is printed to standard output as each
-session completes.
+session completes. On Linux, parallel sessions use Python's `spawn` process
+context because Polars must not be used from forked child processes.
 
 For use from Python:
 
