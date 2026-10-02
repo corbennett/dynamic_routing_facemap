@@ -45,3 +45,6 @@ pnpm-debug.log*
 *.log
 .tmp/
 tmp/
+
+# results
+*.parquet
