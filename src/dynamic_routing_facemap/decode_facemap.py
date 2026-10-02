@@ -6,6 +6,7 @@
 #     "polars>=1.44.2",
 #     "scikit-learn>=1.9.1",
 #     "scipy>=1.17.1",
+#     "tqdm>=4.67.1",
 # ]
 # ///
 
@@ -31,8 +32,9 @@ session types without the behavior filter.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,7 @@ import polars as pl
 from scipy.interpolate import interp1d
 from sklearn.model_selection import cross_val_score
 from sklearn.svm import LinearSVC
+from tqdm import tqdm
 
 
 LOGGER = logging.getLogger(__name__)
@@ -606,23 +609,31 @@ def decode_all_sessions(
 
     # Futures may finish out of order, but the consolidated result and stable
     # checkpoint names retain the sorted session order.
-    if parallelize_sessions:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(decode_one, index, session_id): (index, session_id)
-                for index, session_id in enumerate(session_ids, start=1)
-            }
-            try:
-                for future in as_completed(futures):
-                    index, _session_id = futures[future]
-                    save_result(index, future.result())
-            except Exception:
-                for future in futures:
-                    future.cancel()
-                raise
-    else:
-        for index, session_id in enumerate(session_ids, start=1):
-            save_result(index, decode_one(index, session_id))
+    with tqdm(
+        total=len(session_ids),
+        desc="Decoding sessions",
+        unit="session",
+        file=sys.stdout,
+    ) as progress:
+        if parallelize_sessions:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(decode_one, index, session_id): (index, session_id)
+                    for index, session_id in enumerate(session_ids, start=1)
+                }
+                try:
+                    for future in as_completed(futures):
+                        index, _session_id = futures[future]
+                        save_result(index, future.result())
+                        progress.update(1)
+                except Exception:
+                    for future in futures:
+                        future.cancel()
+                    raise
+        else:
+            for index, session_id in enumerate(session_ids, start=1):
+                save_result(index, decode_one(index, session_id))
+                progress.update(1)
 
     result = pl.DataFrame([row for row in rows if row is not None])
     if output is not None:

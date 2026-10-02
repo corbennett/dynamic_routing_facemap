@@ -42,7 +42,8 @@ Facemap features, 60 Hz sampling, and six-sample sliding windows. Use
 `--all-sessions` to remove the datacube's default brainwide behavior filter.
 Sessions are decoded sequentially by default. Pass `--parallelize-sessions` to
 decode them concurrently; optionally use `--max-workers N` to limit the number
-of concurrent sessions.
+of concurrent sessions. A progress bar is printed to standard output as each
+session completes.
 
 For use from Python:
 

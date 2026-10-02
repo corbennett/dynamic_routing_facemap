@@ -672,6 +672,7 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -682,6 +683,7 @@ requires-dist = [
     { name = "polars", specifier = ">=1.44.2" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
     { name = "scipy", specifier = ">=1.17.1" },
+    { name = "tqdm", specifier = ">=4.67.1" },
 ]
 
 [[package]]
