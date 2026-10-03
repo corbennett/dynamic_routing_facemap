@@ -61,6 +61,11 @@ DEFAULT_SAMPLING_RATE = 60.0
 DEFAULT_WINDOW_LENGTH = 1
 DEFAULT_CV_FOLDS = 5
 
+STIMULUS_MODALITY_BOOLEAN_COLUMNS = {
+    "visual": "is_vis_stim",
+    "auditory": "is_aud_stim",
+}
+
 # These are the behavior fields currently exposed by the Dynamic Routing
 # performance table.  The code checks the schema before selecting them so it
 # remains usable if a datacube version omits one of the fields.
@@ -84,6 +89,53 @@ def _require_columns(frame: pl.DataFrame, required: Sequence[str], name: str) ->
     missing = sorted(set(required).difference(frame.columns))
     if missing:
         raise ValueError(f"{name} is missing required columns: {missing}")
+
+
+def _normalize_stimulus_modality(stimulus_modality: str | None) -> str | None:
+    """Normalize the public visual/auditory modality selector."""
+
+    if stimulus_modality is None:
+        return None
+
+    aliases = {
+        "vis": "visual",
+        "visual": "visual",
+        "aud": "auditory",
+        "audio": "auditory",
+        "auditory": "auditory",
+    }
+    normalized = aliases.get(stimulus_modality.strip().lower())
+    if normalized is None:
+        raise ValueError(
+            "stimulus_modality must be one of visual or auditory, "
+            f"got {stimulus_modality!r}"
+        )
+    return normalized
+
+
+def _filter_stimulus_modality(
+    trials: pl.DataFrame,
+    stimulus_modality: str | None,
+) -> pl.DataFrame:
+    """Keep only trials from one stimulus modality when requested.
+
+    Raise instead of silently returning all trials if the expected modality
+    field cannot be identified.
+    """
+
+    modality = _normalize_stimulus_modality(stimulus_modality)
+    if modality is None:
+        return trials
+
+    column = STIMULUS_MODALITY_BOOLEAN_COLUMNS[modality]
+    if column in trials.columns:
+        return trials.filter(pl.col(column).cast(pl.Boolean, strict=False).eq(True))
+
+    raise ValueError(
+        "stimulus_modality was requested, but no recognizable stimulus "
+        f"modality column {column!r} was found; available "
+        f"trial columns are {trials.columns}"
+    )
 
 
 def _trial_metadata(trials: pl.DataFrame) -> dict[str, dict[str, Any]]:
@@ -256,6 +308,7 @@ def decode_session(
     trials: pl.DataFrame,
     facemap_lf: pl.LazyFrame | pl.DataFrame,
     *,
+    stimulus_modality: str | None = None,
     window: tuple[float, float] = DEFAULT_WINDOW,
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
@@ -287,6 +340,10 @@ def decode_session(
         pl.col("is_instruction").eq(False),
         pl.col("is_response").is_not_null(),
         pl.col("stim_start_time").is_not_null(),
+    )
+    decoding_trials = _filter_stimulus_modality(
+        decoding_trials,
+        stimulus_modality,
     )
     lick_trials = decoding_trials.filter(pl.col("is_response").eq(True))
     no_lick_trials = decoding_trials.filter(pl.col("is_response").eq(False))
@@ -403,6 +460,7 @@ def _base_result_row(
     trial_metadata: Mapping[str, Any],
     behavior_metadata: Mapping[str, Any],
     *,
+    stimulus_modality: str | None,
     window: tuple[float, float],
     features_to_use: int,
     sampling_rate: float,
@@ -418,6 +476,7 @@ def _base_result_row(
         "n_lick_trials": trial_metadata.get("n_lick_trials", 0),
         "n_no_lick_trials": trial_metadata.get("n_no_lick_trials", 0),
         "lick_fraction": trial_metadata.get("lick_fraction"),
+        "stimulus_modality_filter": stimulus_modality,
         "window_capture_start_s": window[0],
         "window_capture_end_s": window[1],
         "sampling_rate_hz": sampling_rate,
@@ -459,6 +518,7 @@ def _decode_one_session(
     *,
     facemap_table: str,
     datacube_kwargs: Mapping[str, Any],
+    stimulus_modality: str | None,
     window: tuple[float, float],
     features_to_use: int,
     sampling_rate: float,
@@ -476,6 +536,7 @@ def _decode_one_session(
         session_trials,
         trial_metadata.get(session_id, {}),
         behavior_metadata.get(session_id, {}),
+        stimulus_modality=stimulus_modality,
         window=window,
         features_to_use=features_to_use,
         sampling_rate=sampling_rate,
@@ -493,6 +554,7 @@ def _decode_one_session(
             decode_session(
                 session_trials,
                 facemap_lf,
+                stimulus_modality=stimulus_modality,
                 window=window,
                 features_to_use=features_to_use,
                 sampling_rate=sampling_rate,
@@ -529,6 +591,7 @@ def decode_all_sessions(
     session_type: str | Sequence[str] | None = "brainwide",
     with_behavior_filter: bool = True,
     only_in_data_asset: bool = True,
+    stimulus_modality: str | None = None,
     window: tuple[float, float] = DEFAULT_WINDOW,
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
@@ -562,6 +625,10 @@ def decode_all_sessions(
     fail_fast:
         Raise on the first session-level error instead of recording it and
         continuing with the other sessions.
+    stimulus_modality:
+        Optional stimulus filter.  Set to ``"visual"`` or ``"auditory"`` to
+        decode only trials from that stimulus modality.  The default includes
+        both modalities.
     parallelize_sessions:
         Decode sessions concurrently. Defaults to ``False`` so the default
         behavior remains sequential and uses one session at a time.
@@ -587,6 +654,8 @@ def decode_all_sessions(
         ["session_id", "is_instruction", "is_response", "stim_start_time"],
         "trials",
     )
+    stimulus_modality = _normalize_stimulus_modality(stimulus_modality)
+    trials = _filter_stimulus_modality(trials, stimulus_modality)
 
     session_ids = (
         trials.select("session_id")
@@ -655,6 +724,7 @@ def decode_all_sessions(
                         behavior_metadata,
                         facemap_table=facemap_table,
                         datacube_kwargs=datacube_kwargs,
+                        stimulus_modality=stimulus_modality,
                         window=window,
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
@@ -686,6 +756,7 @@ def decode_all_sessions(
                         behavior_metadata,
                         facemap_table=facemap_table,
                         datacube_kwargs=datacube_kwargs,
+                        stimulus_modality=stimulus_modality,
                         window=window,
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
@@ -735,6 +806,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window-length", type=int, default=DEFAULT_WINDOW_LENGTH)
     parser.add_argument("--cv-folds", type=int, default=DEFAULT_CV_FOLDS)
     parser.add_argument(
+        "--stimulus-modality",
+        choices=("visual", "auditory"),
+        default=None,
+        help="restrict decoding to visual or auditory stimulus trials",
+    )
+    parser.add_argument(
         "--all-sessions",
         action="store_true",
         help="include all datacube session types and disable the behavior filter",
@@ -767,6 +844,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_path=args.output,
         session_type=None if args.all_sessions else "brainwide",
         with_behavior_filter=not args.all_sessions,
+        stimulus_modality=args.stimulus_modality,
         window=args.window,
         features_to_use=args.features,
         sampling_rate=args.sampling_rate,

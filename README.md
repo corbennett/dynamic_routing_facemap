@@ -13,11 +13,15 @@ uv run dynamic-routing-facemap \
   --verbose
 ```
 
+To analyze one stimulus modality at a time, add `--stimulus-modality visual`
+or `--stimulus-modality auditory`. With no flag, both modalities are included.
+
 The output includes:
 
 - `cv_scores`: mean five-fold accuracy for each sliding window;
 - `window_start_s`, `window_end_s`, and `window_center_s`: matching time lists;
 - `n_lick_trials`, `n_no_lick_trials`, and `lick_fraction`;
+- `stimulus_modality_filter`, recording any visual/auditory filter used;
 - aggregated performance-table fields such as `behavior_hit_rate_mean`,
   `behavior_false_alarm_rate_mean`, `behavior_cross_modality_dprime_mean`,
   `behavior_aud_dprime_mean`, and `behavior_vis_dprime_mean`;
@@ -53,6 +57,7 @@ from dynamic_routing_facemap.decode_facemap import decode_all_sessions
 
 results = decode_all_sessions(
     output_path="results/facemap_lick_decoding.parquet",
+    stimulus_modality="visual",  # or "auditory"; omit to include both
     parallelize_sessions=False,  # set True to decode sessions concurrently
     # max_workers=4,             # optional limit when parallelized
 )
