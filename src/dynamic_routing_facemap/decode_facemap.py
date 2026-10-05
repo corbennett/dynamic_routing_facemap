@@ -47,7 +47,7 @@ import dr_datacube
 import numpy as np
 import polars as pl
 from scipy.interpolate import interp1d
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import LeaveOneGroupOut, cross_val_score
 from sklearn.svm import LinearSVC
 from tqdm import tqdm
 
@@ -59,7 +59,6 @@ DEFAULT_WINDOW = (-0.25, 0.5)
 DEFAULT_FEATURES = 200
 DEFAULT_SAMPLING_RATE = 60.0
 DEFAULT_WINDOW_LENGTH = 1
-DEFAULT_CV_FOLDS = 5
 
 STIMULUS_MODALITY_BOOLEAN_COLUMNS = {
     "visual": "is_vis_stim",
@@ -313,18 +312,24 @@ def decode_session(
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
     window_length: int = DEFAULT_WINDOW_LENGTH,
-    cv_folds: int = DEFAULT_CV_FOLDS,
 ) -> dict[str, Any]:
     """Decode one session and return its windowed CV scores.
 
-    The classifier and split behavior intentionally match the notebook:
-    unscaled Facemap features, a class-balanced ``LinearSVC``, accuracy
-    scoring, and the default non-shuffled stratified five-fold split.
+    The classifier and scoring behavior intentionally match the notebook:
+    unscaled Facemap features, a class-balanced ``LinearSVC``, and accuracy
+    scoring. Cross-validation leaves out one task block at a time, using the
+    six ``block_index`` values as groups.
     """
 
     _require_columns(
         trials,
-        ["session_id", "is_instruction", "is_response", "stim_start_time"],
+        [
+            "session_id",
+            "is_instruction",
+            "is_response",
+            "stim_start_time",
+            "block_index",
+        ],
         "trials",
     )
     if window[1] <= window[0]:
@@ -333,13 +338,13 @@ def decode_session(
         raise ValueError("sampling_rate must be positive")
     if window_length < 1:
         raise ValueError("window_length must be at least one sample")
-    if cv_folds < 2:
-        raise ValueError("cv_folds must be at least two")
 
     decoding_trials = trials.filter(
         pl.col("is_instruction").eq(False),
         pl.col("is_response").is_not_null(),
         pl.col("stim_start_time").is_not_null(),
+        pl.col("stim_start_time").is_finite(),
+        pl.col("block_index").is_not_null(),
     )
     decoding_trials = _filter_stimulus_modality(
         decoding_trials,
@@ -348,10 +353,36 @@ def decode_session(
     lick_trials = decoding_trials.filter(pl.col("is_response").eq(True))
     no_lick_trials = decoding_trials.filter(pl.col("is_response").eq(False))
 
-    if lick_trials.height < cv_folds or no_lick_trials.height < cv_folds:
+    unique_blocks = np.unique(decoding_trials["block_index"].to_numpy())
+    if unique_blocks.size < 2:
         raise ValueError(
-            f"each class needs at least {cv_folds} trials for cross-validation "
-            f"(lick={lick_trials.height}, no_lick={no_lick_trials.height})"
+            "leave-one-block-out cross-validation requires at least two blocks "
+            f"with decodable trials (found {unique_blocks.size})"
+        )
+
+    # Every training split must retain both response classes. Check this
+    # before fitting so incomplete block structures produce a clear
+    # session-level error instead of an invalid LinearSVC score.
+    block_class_counts = (
+        decoding_trials
+        .with_columns(is_lick=pl.col("is_response").cast(pl.Int8))
+        .group_by("block_index")
+        .agg(
+            n_lick=pl.col("is_lick").sum(),
+            n_no_lick=(pl.lit(1) - pl.col("is_lick")).sum(),
+        )
+    )
+    total_lick = int(lick_trials.height)
+    total_no_lick = int(no_lick_trials.height)
+    invalid_training_blocks = block_class_counts.filter(
+        (pl.lit(total_lick) - pl.col("n_lick") <= 0)
+        | (pl.lit(total_no_lick) - pl.col("n_no_lick") <= 0)
+    )
+    if not invalid_training_blocks.is_empty():
+        raise ValueError(
+            "each leave-one-block-out training split needs both lick and "
+            "no-lick trials; the following held-out blocks leave one class "
+            f"absent: {invalid_training_blocks['block_index'].to_list()}"
         )
 
     # Read the camera samples once per session.  Each condition is then
@@ -403,6 +434,14 @@ def decode_session(
             np.zeros(condition_arrays["no_lick"].shape[0], dtype=int),
         ]
     )
+    # X and y are concatenated in lick/no-lick order above, so groups must
+    # use that same order rather than the original trial-table order.
+    block_indices = np.concatenate(
+        [
+            lick_trials["block_index"].to_numpy(),
+            no_lick_trials["block_index"].to_numpy(),
+        ]
+    )
 
     scores: list[float] = []
     for window_start in range(n_samples - window_length + 1):
@@ -432,7 +471,8 @@ def decode_session(
                 classifier,
                 X_window,
                 y,
-                cv=cv_folds,
+                groups=block_indices,
+                cv=LeaveOneGroupOut(),
                 scoring="accuracy",
             )
         scores.append(float(fold_scores.mean()))
@@ -451,6 +491,7 @@ def decode_session(
         "cv_score_mean": float(np.mean(scores)),
         "cv_score_max": float(np.max(scores)),
         "best_window_center_s": float(window_centers[int(np.argmax(scores))]),
+        "cv_folds": int(unique_blocks.size),
     }
 
 
@@ -465,7 +506,6 @@ def _base_result_row(
     features_to_use: int,
     sampling_rate: float,
     window_length: int,
-    cv_folds: int,
 ) -> dict[str, Any]:
     """Build the session metadata shared by successful and failed sessions."""
 
@@ -482,7 +522,8 @@ def _base_result_row(
         "sampling_rate_hz": sampling_rate,
         "features_used": features_to_use,
         "window_length_samples": window_length,
-        "cv_folds": cv_folds,
+        # Filled by decode_session after the available task blocks are known.
+        "cv_folds": None,
         "status": "success",
         "error_type": None,
         "error_message": None,
@@ -523,7 +564,6 @@ def _decode_one_session(
     features_to_use: int,
     sampling_rate: float,
     window_length: int,
-    cv_folds: int,
     fail_fast: bool,
     get_lf: Callable[..., pl.LazyFrame],
 ) -> dict[str, Any]:
@@ -541,7 +581,6 @@ def _decode_one_session(
         features_to_use=features_to_use,
         sampling_rate=sampling_rate,
         window_length=window_length,
-        cv_folds=cv_folds,
     )
 
     try:
@@ -559,7 +598,6 @@ def _decode_one_session(
                 features_to_use=features_to_use,
                 sampling_rate=sampling_rate,
                 window_length=window_length,
-                cv_folds=cv_folds,
             )
         )
     except Exception as exc:  # one problematic session should not stop a batch
@@ -596,7 +634,6 @@ def decode_all_sessions(
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
     window_length: int = DEFAULT_WINDOW_LENGTH,
-    cv_folds: int = DEFAULT_CV_FOLDS,
     fail_fast: bool = False,
     parallelize_sessions: bool = False,
     max_workers: int | None = None,
@@ -651,7 +688,13 @@ def decode_all_sessions(
     trials = _collect(trials_lf)
     _require_columns(
         trials,
-        ["session_id", "is_instruction", "is_response", "stim_start_time"],
+        [
+            "session_id",
+            "is_instruction",
+            "is_response",
+            "stim_start_time",
+            "block_index",
+        ],
         "trials",
     )
     stimulus_modality = _normalize_stimulus_modality(stimulus_modality)
@@ -729,7 +772,6 @@ def decode_all_sessions(
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
                         window_length=window_length,
-                        cv_folds=cv_folds,
                         fail_fast=fail_fast,
                         get_lf=get_lf,
                     ): (index, session_id)
@@ -761,7 +803,6 @@ def decode_all_sessions(
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
                         window_length=window_length,
-                        cv_folds=cv_folds,
                         fail_fast=fail_fast,
                         get_lf=get_lf,
                     ),
@@ -804,7 +845,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--features", type=int, default=DEFAULT_FEATURES)
     parser.add_argument("--sampling-rate", type=float, default=DEFAULT_SAMPLING_RATE)
     parser.add_argument("--window-length", type=int, default=DEFAULT_WINDOW_LENGTH)
-    parser.add_argument("--cv-folds", type=int, default=DEFAULT_CV_FOLDS)
     parser.add_argument(
         "--stimulus-modality",
         choices=("visual", "auditory"),
@@ -849,7 +889,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         features_to_use=args.features,
         sampling_rate=args.sampling_rate,
         window_length=args.window_length,
-        cv_folds=args.cv_folds,
         fail_fast=args.fail_fast,
         parallelize_sessions=args.parallelize_sessions,
         max_workers=args.max_workers,

@@ -18,7 +18,8 @@ or `--stimulus-modality auditory`. With no flag, both modalities are included.
 
 The output includes:
 
-- `cv_scores`: mean five-fold accuracy for each sliding window;
+- `cv_scores`: mean leave-one-block-out accuracy for each sliding window;
+- `cv_folds`: number of nonempty task blocks used as CV folds (normally six);
 - `window_start_s`, `window_end_s`, and `window_center_s`: matching time lists;
 - `n_lick_trials`, `n_no_lick_trials`, and `lick_fraction`;
 - `stimulus_modality_filter`, recording any visual/auditory filter used;
@@ -42,7 +43,10 @@ partial_results = pl.read_parquet(
 ```
 
 The defaults match the notebook: a `[-1, 1]` second capture window, 200
-Facemap features, 60 Hz sampling, and six-sample sliding windows. Use
+Facemap features, 60 Hz sampling, and six-sample sliding windows. Cross-
+validation holds out each of the six task blocks in turn, identified by the
+trial `block_index` (including both auditory- and visually-rewarded blocks).
+Use
 `--all-sessions` to remove the datacube's default brainwide behavior filter.
 Sessions are decoded sequentially by default. Pass `--parallelize-sessions` to
 decode them concurrently; optionally use `--max-workers N` to limit the number
