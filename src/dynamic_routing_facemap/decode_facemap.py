@@ -65,6 +65,12 @@ STIMULUS_MODALITY_BOOLEAN_COLUMNS = {
     "auditory": "is_aud_stim",
 }
 
+TARGET_BOOLEAN_COLUMNS = {
+    "visual": "is_vis_target",
+    "auditory": "is_aud_target",
+}
+BALANCE_RANDOM_SEED = 0
+
 # These are the behavior fields currently exposed by the Dynamic Routing
 # performance table.  The code checks the schema before selecting them so it
 # remains usable if a datacube version omits one of the fields.
@@ -135,6 +141,98 @@ def _filter_stimulus_modality(
         f"modality column {column!r} was found; available "
         f"trial columns are {trials.columns}"
     )
+
+
+def _filter_target_trials(
+    trials: pl.DataFrame,
+    *,
+    stimulus_modality: str | None,
+    target_trials_only: bool,
+) -> pl.DataFrame:
+    """Keep only target trials when requested.
+
+    With a modality filter, use the corresponding target flag. Without one,
+    retain trials marked as either visual or auditory targets.
+    """
+
+    if not target_trials_only:
+        return trials
+
+    modality = _normalize_stimulus_modality(stimulus_modality)
+    target_columns = (
+        (TARGET_BOOLEAN_COLUMNS[modality],)
+        if modality is not None
+        else tuple(TARGET_BOOLEAN_COLUMNS.values())
+    )
+    missing = sorted(set(target_columns).difference(trials.columns))
+    if missing:
+        raise ValueError(
+            "target_trials_only was requested, but the trial table is missing "
+            f"target columns {missing}; available trial columns are {trials.columns}"
+        )
+
+    is_target = pl.any_horizontal(
+        [pl.col(column).cast(pl.Boolean, strict=False).eq(True) for column in target_columns]
+    )
+    return trials.filter(is_target)
+
+
+def _balance_trials_by_block(trials: pl.DataFrame) -> pl.DataFrame:
+    """Balance lick and no-lick trial counts independently in each block.
+
+    The smaller response class determines the retained count for each
+    session/block pair. Surplus trials are sampled reproducibly and all
+    non-decoding rows are retained unchanged.
+    """
+
+    if trials.is_empty():
+        return trials
+
+    _require_columns(
+        trials,
+        [
+            "session_id",
+            "is_instruction",
+            "is_response",
+            "stim_start_time",
+            "block_index",
+        ],
+        "trials",
+    )
+
+    stim_start = trials.select(
+        pl.col("stim_start_time").cast(pl.Float64, strict=False)
+    )["stim_start_time"].to_numpy()
+    eligible = (
+        (trials["is_instruction"].to_numpy() == False)  # noqa: E712
+        & (trials["is_response"].is_not_null().to_numpy())
+        & np.isfinite(stim_start)
+        & (trials["block_index"].is_not_null().to_numpy())
+    )
+
+    grouped_indices: dict[tuple[Any, Any], dict[bool, list[int]]] = {}
+    session_ids = trials["session_id"].to_list()
+    block_indices = trials["block_index"].to_list()
+    responses = trials["is_response"].to_list()
+    for index in np.flatnonzero(eligible):
+        response = bool(responses[index])
+        key = (session_ids[index], block_indices[index])
+        grouped_indices.setdefault(key, {True: [], False: []})[response].append(index)
+
+    keep = np.ones(trials.height, dtype=bool)
+    rng = np.random.default_rng(BALANCE_RANDOM_SEED)
+    for response_indices in grouped_indices.values():
+        target_count = min(
+            len(response_indices[True]),
+            len(response_indices[False]),
+        )
+        for indices in response_indices.values():
+            if len(indices) > target_count:
+                retained = rng.choice(indices, size=target_count, replace=False)
+                retained_set = set(retained.tolist())
+                keep[np.asarray([index for index in indices if index not in retained_set])] = False
+
+    return trials.filter(pl.Series("__keep", keep))
 
 
 def _trial_metadata(trials: pl.DataFrame) -> dict[str, dict[str, Any]]:
@@ -308,6 +406,8 @@ def decode_session(
     facemap_lf: pl.LazyFrame | pl.DataFrame,
     *,
     stimulus_modality: str | None = None,
+    target_trials_only: bool = False,
+    balance_trials_across_blocks: bool = False,
     window: tuple[float, float] = DEFAULT_WINDOW,
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
@@ -318,7 +418,8 @@ def decode_session(
     The classifier and scoring behavior intentionally match the notebook:
     unscaled Facemap features, a class-balanced ``LinearSVC``, and accuracy
     scoring. Cross-validation leaves out one task block at a time, using the
-    six ``block_index`` values as groups.
+    six ``block_index`` values as groups. When requested, each block contains
+    equal numbers of lick and no-lick trials after deterministic downsampling.
     """
 
     _require_columns(
@@ -350,6 +451,13 @@ def decode_session(
         decoding_trials,
         stimulus_modality,
     )
+    decoding_trials = _filter_target_trials(
+        decoding_trials,
+        stimulus_modality=stimulus_modality,
+        target_trials_only=target_trials_only,
+    )
+    if balance_trials_across_blocks:
+        decoding_trials = _balance_trials_by_block(decoding_trials)
     lick_trials = decoding_trials.filter(pl.col("is_response").eq(True))
     no_lick_trials = decoding_trials.filter(pl.col("is_response").eq(False))
 
@@ -502,6 +610,8 @@ def _base_result_row(
     behavior_metadata: Mapping[str, Any],
     *,
     stimulus_modality: str | None,
+    target_trials_only: bool,
+    balance_trials_across_blocks: bool,
     window: tuple[float, float],
     features_to_use: int,
     sampling_rate: float,
@@ -517,6 +627,8 @@ def _base_result_row(
         "n_no_lick_trials": trial_metadata.get("n_no_lick_trials", 0),
         "lick_fraction": trial_metadata.get("lick_fraction"),
         "stimulus_modality_filter": stimulus_modality,
+        "target_trials_only": target_trials_only,
+        "balance_trials_across_blocks": balance_trials_across_blocks,
         "window_capture_start_s": window[0],
         "window_capture_end_s": window[1],
         "sampling_rate_hz": sampling_rate,
@@ -560,6 +672,8 @@ def _decode_one_session(
     facemap_table: str,
     datacube_kwargs: Mapping[str, Any],
     stimulus_modality: str | None,
+    target_trials_only: bool,
+    balance_trials_across_blocks: bool,
     window: tuple[float, float],
     features_to_use: int,
     sampling_rate: float,
@@ -577,6 +691,8 @@ def _decode_one_session(
         trial_metadata.get(session_id, {}),
         behavior_metadata.get(session_id, {}),
         stimulus_modality=stimulus_modality,
+        target_trials_only=target_trials_only,
+        balance_trials_across_blocks=balance_trials_across_blocks,
         window=window,
         features_to_use=features_to_use,
         sampling_rate=sampling_rate,
@@ -594,6 +710,8 @@ def _decode_one_session(
                 session_trials,
                 facemap_lf,
                 stimulus_modality=stimulus_modality,
+                target_trials_only=target_trials_only,
+                balance_trials_across_blocks=balance_trials_across_blocks,
                 window=window,
                 features_to_use=features_to_use,
                 sampling_rate=sampling_rate,
@@ -630,6 +748,8 @@ def decode_all_sessions(
     with_behavior_filter: bool = True,
     only_in_data_asset: bool = True,
     stimulus_modality: str | None = None,
+    target_trials_only: bool = False,
+    balance_trials_across_blocks: bool = False,
     window: tuple[float, float] = DEFAULT_WINDOW,
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
@@ -666,6 +786,14 @@ def decode_all_sessions(
         Optional stimulus filter.  Set to ``"visual"`` or ``"auditory"`` to
         decode only trials from that stimulus modality.  The default includes
         both modalities.
+    target_trials_only:
+        If true, decode only target trials. With a stimulus modality filter,
+        this uses the matching ``is_vis_target`` or ``is_aud_target`` field;
+        without one, either target field qualifies.
+    balance_trials_across_blocks:
+        If true, downsample the larger response class within each block so
+        every block has equal lick and no-lick trial counts. The sample is
+        deterministic.
     parallelize_sessions:
         Decode sessions concurrently. Defaults to ``False`` so the default
         behavior remains sequential and uses one session at a time.
@@ -699,6 +827,13 @@ def decode_all_sessions(
     )
     stimulus_modality = _normalize_stimulus_modality(stimulus_modality)
     trials = _filter_stimulus_modality(trials, stimulus_modality)
+    trials = _filter_target_trials(
+        trials,
+        stimulus_modality=stimulus_modality,
+        target_trials_only=target_trials_only,
+    )
+    if balance_trials_across_blocks:
+        trials = _balance_trials_by_block(trials)
 
     session_ids = (
         trials.select("session_id")
@@ -768,6 +903,8 @@ def decode_all_sessions(
                         facemap_table=facemap_table,
                         datacube_kwargs=datacube_kwargs,
                         stimulus_modality=stimulus_modality,
+                        target_trials_only=target_trials_only,
+                        balance_trials_across_blocks=balance_trials_across_blocks,
                         window=window,
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
@@ -799,6 +936,8 @@ def decode_all_sessions(
                         facemap_table=facemap_table,
                         datacube_kwargs=datacube_kwargs,
                         stimulus_modality=stimulus_modality,
+                        target_trials_only=target_trials_only,
+                        balance_trials_across_blocks=balance_trials_across_blocks,
                         window=window,
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
@@ -852,6 +991,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="restrict decoding to visual or auditory stimulus trials",
     )
     parser.add_argument(
+        "--target-trials-only",
+        action="store_true",
+        help="restrict decoding to visual/auditory target trials",
+    )
+    parser.add_argument(
+        "--balance-trials-across-blocks",
+        action="store_true",
+        help="balance lick and no-lick trial counts within each block",
+    )
+    parser.add_argument(
         "--all-sessions",
         action="store_true",
         help="include all datacube session types and disable the behavior filter",
@@ -885,6 +1034,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         session_type=None if args.all_sessions else "brainwide",
         with_behavior_filter=not args.all_sessions,
         stimulus_modality=args.stimulus_modality,
+        target_trials_only=args.target_trials_only,
+        balance_trials_across_blocks=args.balance_trials_across_blocks,
         window=args.window,
         features_to_use=args.features,
         sampling_rate=args.sampling_rate,

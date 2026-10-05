@@ -15,6 +15,11 @@ uv run dynamic-routing-facemap \
 
 To analyze one stimulus modality at a time, add `--stimulus-modality visual`
 or `--stimulus-modality auditory`. With no flag, both modalities are included.
+Add `--target-trials-only` to restrict decoding to target trials. When combined
+with a modality flag, the corresponding `is_vis_target` or `is_aud_target`
+column is used; without one, either target flag qualifies.
+Add `--balance-trials-across-blocks` to downsample the larger response class
+within each block so that block has equal lick and no-lick trial counts.
 
 The output includes:
 
@@ -23,6 +28,9 @@ The output includes:
 - `window_start_s`, `window_end_s`, and `window_center_s`: matching time lists;
 - `n_lick_trials`, `n_no_lick_trials`, and `lick_fraction`;
 - `stimulus_modality_filter`, recording any visual/auditory filter used;
+- `target_trials_only`, recording whether target-only filtering was enabled;
+- `balance_trials_across_blocks`, recording whether per-block class balancing
+  was enabled;
 - aggregated performance-table fields such as `behavior_hit_rate_mean`,
   `behavior_false_alarm_rate_mean`, `behavior_cross_modality_dprime_mean`,
   `behavior_aud_dprime_mean`, and `behavior_vis_dprime_mean`;
