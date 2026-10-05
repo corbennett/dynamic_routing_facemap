@@ -14,7 +14,7 @@
 
 The main entry point, :func:`decode_all_sessions`, mirrors the workflow in
 ``scratch.ipynb`` but applies it to every session in a trials LazyFrame.  The
-returned table has one row per session.  The CV accuracy for each sliding
+returned table has one row per session.  The CV balanced accuracy for each sliding
 window is stored in the ``cv_scores`` list column alongside the corresponding
 window times and session-level behavior metadata.
 
@@ -416,10 +416,11 @@ def decode_session(
     """Decode one session and return its windowed CV scores.
 
     The classifier and scoring behavior intentionally match the notebook:
-    unscaled Facemap features, a class-balanced ``LinearSVC``, and accuracy
-    scoring. Cross-validation leaves out one task block at a time, using the
-    six ``block_index`` values as groups. When requested, each block contains
-    equal numbers of lick and no-lick trials after deterministic downsampling.
+    unscaled Facemap features, a class-balanced ``LinearSVC``, and balanced
+    accuracy scoring. Cross-validation leaves out one task block at a time,
+    using the six ``block_index`` values as groups. When requested, each block
+    contains equal numbers of lick and no-lick trials after deterministic
+    downsampling.
     """
 
     _require_columns(
@@ -581,7 +582,7 @@ def decode_session(
                 y,
                 groups=block_indices,
                 cv=LeaveOneGroupOut(),
-                scoring="accuracy",
+                scoring="balanced_accuracy",
             )
         scores.append(float(fold_scores.mean()))
 
