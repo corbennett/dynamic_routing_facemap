@@ -59,6 +59,8 @@ DEFAULT_WINDOW = (-0.25, 0.5)
 DEFAULT_FEATURES = 200
 DEFAULT_SAMPLING_RATE = 60.0
 DEFAULT_WINDOW_LENGTH = 1
+DEFAULT_FRAME_GAP_THRESHOLD_S = 0.025
+DEFAULT_MAX_FRAME_GAPS = 1_000
 
 STIMULUS_MODALITY_BOOLEAN_COLUMNS = {
     "visual": "is_vis_stim",
@@ -94,6 +96,44 @@ def _require_columns(frame: pl.DataFrame, required: Sequence[str], name: str) ->
     missing = sorted(set(required).difference(frame.columns))
     if missing:
         raise ValueError(f"{name} is missing required columns: {missing}")
+
+
+def _frame_gap_metadata(
+    facemap_lf: pl.LazyFrame | pl.DataFrame,
+    *,
+    threshold_s: float,
+) -> dict[str, int | float]:
+    """Count long intervals in the full Facemap timestamp stream."""
+
+    if threshold_s <= 0:
+        raise ValueError("frame_gap_threshold_s must be positive")
+
+    timestamps = (
+        facemap_lf.lazy() if isinstance(facemap_lf, pl.DataFrame) else facemap_lf
+    )
+    summary = (
+        timestamps.select("timestamps")
+        .filter(
+            pl.col("timestamps").is_not_null(),
+            pl.col("timestamps").is_finite(),
+        )
+        .sort("timestamps")
+        .with_columns(frame_interval_s=pl.col("timestamps").diff())
+        .select(
+            facemap_n_frames=pl.len(),
+            facemap_n_frame_gaps=pl.col("frame_interval_s").gt(threshold_s).sum(),
+        )
+        .collect()
+    )
+    n_frames = int(summary["facemap_n_frames"][0])
+    if n_frames < 2:
+        raise ValueError("at least two finite Facemap timestamps are required for QC")
+    n_gaps = int(summary["facemap_n_frame_gaps"][0])
+    return {
+        "facemap_n_frames": n_frames,
+        "facemap_n_frame_gaps": n_gaps,
+        "facemap_frame_gap_fraction": n_gaps / (n_frames - 1),
+    }
 
 
 def _normalize_stimulus_modality(stimulus_modality: str | None) -> str | None:
@@ -613,6 +653,8 @@ def _base_result_row(
     stimulus_modality: str | None,
     target_trials_only: bool,
     balance_trials_across_blocks: bool,
+    frame_gap_threshold_s: float,
+    max_frame_gaps: int | None,
     window: tuple[float, float],
     features_to_use: int,
     sampling_rate: float,
@@ -630,6 +672,12 @@ def _base_result_row(
         "stimulus_modality_filter": stimulus_modality,
         "target_trials_only": target_trials_only,
         "balance_trials_across_blocks": balance_trials_across_blocks,
+        "frame_gap_threshold_ms": frame_gap_threshold_s * 1_000,
+        "max_frame_gaps": max_frame_gaps,
+        "facemap_n_frames": None,
+        "facemap_n_frame_gaps": None,
+        "facemap_frame_gap_fraction": None,
+        "qc_exclusion_reason": None,
         "window_capture_start_s": window[0],
         "window_capture_end_s": window[1],
         "sampling_rate_hz": sampling_rate,
@@ -675,6 +723,8 @@ def _decode_one_session(
     stimulus_modality: str | None,
     target_trials_only: bool,
     balance_trials_across_blocks: bool,
+    frame_gap_threshold_s: float,
+    max_frame_gaps: int | None,
     window: tuple[float, float],
     features_to_use: int,
     sampling_rate: float,
@@ -694,6 +744,8 @@ def _decode_one_session(
         stimulus_modality=stimulus_modality,
         target_trials_only=target_trials_only,
         balance_trials_across_blocks=balance_trials_across_blocks,
+        frame_gap_threshold_s=frame_gap_threshold_s,
+        max_frame_gaps=max_frame_gaps,
         window=window,
         features_to_use=features_to_use,
         sampling_rate=sampling_rate,
@@ -706,6 +758,33 @@ def _decode_one_session(
             session_id=session_id,
             **datacube_kwargs,
         )
+        if max_frame_gaps is not None:
+            frame_gap_metadata = _frame_gap_metadata(
+                facemap_lf,
+                threshold_s=frame_gap_threshold_s,
+            )
+            row.update(frame_gap_metadata)
+            if frame_gap_metadata["facemap_n_frame_gaps"] > max_frame_gaps:
+                LOGGER.warning(
+                    "Excluding session %s: %d Facemap frame gaps exceed %.3f ms "
+                    "(maximum allowed: %d)",
+                    session_id,
+                    frame_gap_metadata["facemap_n_frame_gaps"],
+                    frame_gap_threshold_s * 1_000,
+                    max_frame_gaps,
+                )
+                row.update(
+                    status="excluded_qc",
+                    qc_exclusion_reason="facemap_frame_gaps",
+                    cv_scores=None,
+                    window_start_s=None,
+                    window_end_s=None,
+                    window_center_s=None,
+                    cv_score_mean=None,
+                    cv_score_max=None,
+                    best_window_center_s=None,
+                )
+                return row
         row.update(
             decode_session(
                 session_trials,
@@ -751,6 +830,8 @@ def decode_all_sessions(
     stimulus_modality: str | None = None,
     target_trials_only: bool = False,
     balance_trials_across_blocks: bool = False,
+    frame_gap_threshold_s: float = DEFAULT_FRAME_GAP_THRESHOLD_S,
+    max_frame_gaps: int | None = DEFAULT_MAX_FRAME_GAPS,
     window: tuple[float, float] = DEFAULT_WINDOW,
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
@@ -795,6 +876,15 @@ def decode_all_sessions(
         If true, downsample the larger response class within each block so
         every block has equal lick and no-lick trial counts. The sample is
         deterministic.
+    frame_gap_threshold_s:
+        Facemap frame intervals longer than this duration are counted as QC
+        gaps. The default is 0.025 seconds (25 ms).
+    max_frame_gaps:
+        Exclude a session from classifier fitting when its full Facemap
+        timestamp stream contains more than this many QC gaps. The default is
+        1,000; exactly 1,000 gaps remains eligible. Set to ``None`` to disable
+        frame-gap QC. Excluded sessions remain in the result with
+        ``status="excluded_qc"`` and null decoding scores.
     parallelize_sessions:
         Decode sessions concurrently. Defaults to ``False`` so the default
         behavior remains sequential and uses one session at a time.
@@ -806,6 +896,11 @@ def decode_all_sessions(
         Dependency-injection hook useful for tests or a local data loader.  A
         custom loader must be picklable when ``parallelize_sessions`` is true.
     """
+
+    if frame_gap_threshold_s <= 0:
+        raise ValueError("frame_gap_threshold_s must be positive")
+    if max_frame_gaps is not None and max_frame_gaps < 0:
+        raise ValueError("max_frame_gaps must be nonnegative or None")
 
     datacube_kwargs = {
         "session_type": session_type,
@@ -906,6 +1001,8 @@ def decode_all_sessions(
                         stimulus_modality=stimulus_modality,
                         target_trials_only=target_trials_only,
                         balance_trials_across_blocks=balance_trials_across_blocks,
+                        frame_gap_threshold_s=frame_gap_threshold_s,
+                        max_frame_gaps=max_frame_gaps,
                         window=window,
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
@@ -939,6 +1036,8 @@ def decode_all_sessions(
                         stimulus_modality=stimulus_modality,
                         target_trials_only=target_trials_only,
                         balance_trials_across_blocks=balance_trials_across_blocks,
+                        frame_gap_threshold_s=frame_gap_threshold_s,
+                        max_frame_gaps=max_frame_gaps,
                         window=window,
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
@@ -1002,6 +1101,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="balance lick and no-lick trial counts within each block",
     )
     parser.add_argument(
+        "--frame-gap-threshold-ms",
+        type=float,
+        default=DEFAULT_FRAME_GAP_THRESHOLD_S * 1_000,
+        help="frame interval counted as a QC gap in ms (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-frame-gaps",
+        type=int,
+        default=DEFAULT_MAX_FRAME_GAPS,
+        help=(
+            "exclude sessions with more than this many QC frame gaps "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--all-sessions",
         action="store_true",
         help="include all datacube session types and disable the behavior filter",
@@ -1037,6 +1151,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         stimulus_modality=args.stimulus_modality,
         target_trials_only=args.target_trials_only,
         balance_trials_across_blocks=args.balance_trials_across_blocks,
+        frame_gap_threshold_s=args.frame_gap_threshold_ms / 1_000,
+        max_frame_gaps=args.max_frame_gaps,
         window=args.window,
         features_to_use=args.features,
         sampling_rate=args.sampling_rate,

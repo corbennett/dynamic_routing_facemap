@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.4.6",
     "polars>=1.44.2",
+    "polars-vec-ops>=0.1.8",
     "scikit-learn>=1.9.1",
     "scipy>=1.17.1",
     "tqdm>=4.67.1",

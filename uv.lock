@@ -669,6 +669,7 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "polars" },
+    { name = "polars-vec-ops" },
     { name = "scikit-learn" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -681,6 +682,7 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "polars", specifier = ">=1.44.2" },
+    { name = "polars-vec-ops", specifier = ">=0.1.8" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
     { name = "scipy", specifier = ">=1.17.1" },
     { name = "tqdm", specifier = ">=4.67.1" },
@@ -1808,6 +1810,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/06/8f/d741afb1dcd1848161189e017d27972e7e78556d8dce66b94d4235093706/polars_runtime_32-1.44.2-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:c4a09fb14aad711526346efc0cb2015c2fd0555ce4118b6524e5debbaea65ff5", size = 49887654, upload-time = "2026-09-09T07:40:37.455Z" },
     { url = "https://files.pythonhosted.org/packages/ba/e7/c61c1c7eea37705920fe7c1302d1dd80d1165db2b928f0da3eae6d1ebb75/polars_runtime_32-1.44.2-cp310-abi3-win_amd64.whl", hash = "sha256:8598e7a20efba70bb74978c7df7af7c606ff4d79b9b48fdd808250b189bc9a13", size = 51297967, upload-time = "2026-09-09T07:40:41.993Z" },
     { url = "https://files.pythonhosted.org/packages/e7/a0/d0dd0d2ec95fa328dd47055905fae53ba3cd79f11c8973326ebe75a49e4c/polars_runtime_32-1.44.2-cp310-abi3-win_arm64.whl", hash = "sha256:d51040d3ab40157f6db3c62be59cab5b80fb3c8d158924769c4982a1c8eef730", size = 44303345, upload-time = "2026-09-09T07:40:47.081Z" },
+]
+
+[[package]]
+name = "polars-vec-ops"
+version = "0.1.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "polars" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d2/ed/2d61df84001da8b21b5caff68a5496bb21d9dfd3cf3963ff4f087935fe48/polars_vec_ops-0.1.8.tar.gz", hash = "sha256:831fd8fad312d43be2eb9863cb2919acb968286ef7c3335720af2d0212d62289", size = 231112, upload-time = "2026-04-17T03:08:46.648Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/a1/062868d3762c28aa20ad5b8583b34ae1700cac6f1ceb1db1985bb8305231/polars_vec_ops-0.1.8-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:00c8debdb9accd09b2b4b4334ae2798520778aa737ffd2fcb0548800a8ee10ba", size = 3395068, upload-time = "2026-04-17T03:08:44.882Z" },
+    { url = "https://files.pythonhosted.org/packages/de/91/e9824c0f4ec3038b276c5bbe6a8e915e44086cdfdbd1e63e41cdd20a6fbc/polars_vec_ops-0.1.8-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:0c4b0e5214a0be1453c676ed49987cc3eba5cf6ad208ee9c9fafcdf215d9b02d", size = 3855526, upload-time = "2026-04-17T03:08:40.947Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/90/7b9ebf501a0ae89d60365af046e9c5df96c6a70f53fa65ebab32359ee2d7/polars_vec_ops-0.1.8-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:52e081e95128c8e69827207820cf8a0ce8294c089b5ec4d4d1d08a19217eb66b", size = 4084142, upload-time = "2026-04-17T03:08:42.788Z" },
+    { url = "https://files.pythonhosted.org/packages/79/c2/f875e8fc46897dbb0071ba65a0f689113f2eaaa0f87a34b6808cc61de452/polars_vec_ops-0.1.8-cp39-abi3-win_amd64.whl", hash = "sha256:3bedbb32d1ae19fa30fa1facead5bb0075f7b3cd3f2de73c2ac5757a5755c705", size = 3208993, upload-time = "2026-04-17T03:08:48.121Z" },
 ]
 
 [[package]]
