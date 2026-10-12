@@ -40,6 +40,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 from warnings import catch_warnings, filterwarnings
 
@@ -959,7 +960,8 @@ def _decode_one_session(
         )
         projections = decoded.pop("frame_projections", None)
         if projections is not None:
-            projection_path = projection_dir / f"session-{index:06d}.parquet"
+            # Keep the session recognizable while escaping path separators.
+            projection_path = projection_dir / f"{quote(str(session_id), safe='')}.parquet"
             _write_parquet_atomically(
                 projections.with_columns(pl.lit(session_id).alias("session_id")),
                 projection_path,

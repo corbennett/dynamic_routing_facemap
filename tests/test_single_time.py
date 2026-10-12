@@ -144,6 +144,7 @@ class SingleTimeTests(unittest.TestCase):
                 saved = pl.read_parquet(root / "results.parquet")
                 row = saved.filter(pl.col("session_id") == "good").to_dicts()[0]
                 self.assertEqual(len(row["decoder_axes"]), 4)
+                self.assertEqual(Path(row["frame_projections_path"]).name, "good.parquet")
                 frames = pl.read_parquet(row["frame_projections_path"])
                 self.assertEqual(frames.height, fixture()[1].height)
                 self.assertEqual(frames["session_id"].unique().to_list(), ["good"])

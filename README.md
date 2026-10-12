@@ -142,9 +142,15 @@ The following additional fields are saved:
   toward the lick-response class. They are decoder coefficients, not correlations
   between individual features and licking.
 - `frame_projections_path`: path to a per-session Parquet file, if
-  `projection_dir` was supplied. Files live in a unique run subdirectory so
+  `projection_dir` was supplied. Files are named `<session_id>.parquet`, for
+  example `644866_2023-02-10.parquet` (special characters are URL-escaped).
+  Files live in a unique run subdirectory so
   subsequent runs do not overwrite previous projections. Without this option,
   axes and CV scores are still saved but full-session projections are not computed.
+
+The summary table maps `session_id` to `frame_projections_path`, and each
+projection file also stores `session_id` on every row. Earlier runs with
+numbered filenames (`session-000001.parquet`, etc.) use the same mapping.
 
 Each projection file contains `session_id`, `frame_index`, the original
 `timestamps`, and one score column per `model_id`. Every original camera row is
