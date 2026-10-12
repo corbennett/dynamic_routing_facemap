@@ -59,8 +59,8 @@ partial_results = pl.read_parquet(
 )
 ```
 
-The defaults match the notebook: a `[-1, 1]` second capture window, 200
-Facemap features, 60 Hz sampling, and six-sample sliding windows. Cross-
+The defaults are a `[-0.25, 0.5)` second capture window, 200
+Facemap features, 60 Hz sampling, and one-sample sliding windows. Cross-
 validation holds out each of the six task blocks in turn, identified by the
 trial `block_index` (including both auditory- and visually-rewarded blocks).
 Use
@@ -91,4 +91,101 @@ To turn the list-valued scores into a long table for plotting:
 long_results = results.explode(
     ["window_start_s", "window_end_s", "window_center_s", "cv_scores"]
 )
+```
+
+## Train at a fixed time and save continuous decoder scores
+
+Use `--train-time` to train one window centered at a specified time relative
+to stimulus onset. For example, train a six-sample window centered at 0.5 s:
+
+```bash
+uv run dynamic-routing-facemap \
+  --train-time 0.5 \
+  --window-length 6 \
+  --projection-dir results/lick_axis_frames \
+  --output results/lick_axis.parquet
+```
+
+Or from Python:
+
+```python
+results = decode_all_sessions(
+    train_time_s=0.5,
+    window_length=6,  # use 1 for a single instantaneous sample
+    projection_dir="results/lick_axis_frames",
+    output_path="results/lick_axis.parquet",
+)
+```
+
+Samples are linearly interpolated at offsets
+`(arange(window_length) - (window_length - 1) / 2) / sampling_rate` from the
+requested center. Six samples at 60 Hz span 0.45833–0.54167 s when centered at
+0.5 s. Features at successive sample offsets are concatenated, as in the
+sliding-window decoder, rather than averaged. Fixed-time training is independent
+of `--window`; it can train at 0.5 s even though the default capture interval
+ends there. All requested training samples must lie within the camera recording.
+
+The session results retain a one-element `cv_scores` list containing mean
+leave-one-block-out balanced accuracy at the selected window. In this mode,
+`window_start_s` and `window_end_s` record the first and last sample times,
+and `window_center_s` records the requested center. They coincide for one sample.
+The following additional fields are saved:
+
+- `train_time_s`: the requested stimulus-relative window center.
+- `decoder_axes`: one entry for `all_trials` and one per CV fold (`holdout_0`,
+  `holdout_1`, etc.). Each entry contains `model_id`, `held_out_block`,
+  `feature_indices`, `sample_offsets_s`, `coefficients`, `intercept`, training
+  and test trial counts, and the fold's `balanced_accuracy` (null for the full fit).
+  The three coefficient arrays have matching lengths: each coefficient belongs
+  to one feature at one time offset. Feature indices are zero-based indices into
+  the original Facemap `data` vector. Weights use unscaled features and point
+  toward the lick-response class. They are decoder coefficients, not correlations
+  between individual features and licking.
+- `frame_projections_path`: path to a per-session Parquet file, if
+  `projection_dir` was supplied. Files live in a unique run subdirectory so
+  subsequent runs do not overwrite previous projections. Without this option,
+  axes and CV scores are still saved but full-session projections are not computed.
+
+Each projection file contains `session_id`, `frame_index`, the original
+`timestamps`, and one score column per `model_id`. Every original camera row is
+preserved, including intertrial frames and duplicate timestamps. At each
+timestamp the same centered window is sampled, and its score is
+`X_window @ coefficients + intercept`. For one-sample projections the original
+feature vector is used directly. Multi-sample projections use linear interpolation
+onto the offsets above (the first row at a duplicate timestamp is used for
+interpolation). Scores are null when the full window extends outside the
+recording or its inputs are non-finite. These centered windows include samples
+after their timestamp and are intended for offline analysis.
+
+These are **decoder scores, not calibrated lick probabilities**. The `all_trials`
+column uses a single model fitted to all eligible training trials. Each `holdout_*`
+column also covers the entire recording, but is a held-out prediction **only for
+trials in the block identified by that axis's `held_out_block`**. Choose that
+column when analyzing that block; the fold number need not equal the block index.
+The score columns are kept separate to preserve which axis generated each value.
+Filtering and balancing affect model training, not which camera frames are saved.
+
+Read the frames and reconstruct a coefficient matrix with:
+
+```python
+import numpy as np
+
+row = results.filter(pl.col("status") == "success").to_dicts()[0]
+frames = pl.read_parquet(row["frame_projections_path"])
+axis = row["decoder_axes"][0]  # all_trials; other entries identify held-out blocks
+weights = np.asarray(axis["coefficients"]).reshape(
+    row["features_used"], row["window_length_samples"]
+)
+# weights[feature_index, sample_index], ordered from earliest to latest offset
+```
+
+For direct use, `decode_session(..., train_time_s=0.5,
+project_full_session=True)` returns the axes and an in-memory
+`frame_projections` DataFrame without writing files. Full-session arrays are
+projected in chunks to limit memory use for multi-sample windows.
+
+Synthetic checks can be run without downloading data:
+
+```bash
+uv run python -m unittest discover -s tests -v
 ```

@@ -47,6 +47,7 @@ import dr_datacube
 import numpy as np
 import polars as pl
 from scipy.interpolate import interp1d
+from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import LeaveOneGroupOut, cross_val_score
 from sklearn.svm import LinearSVC
 from tqdm import tqdm
@@ -441,6 +442,122 @@ def _interpolate_trials(
     return interpolator(target_times).transpose(0, 2, 1)
 
 
+def _validate_single_time_options(
+    train_time_s: float | None, window_length: int, project_full_session: bool,
+) -> None:
+    if window_length < 1:
+        raise ValueError("window_length must be at least one sample")
+    if train_time_s is not None:
+        if not np.isfinite(train_time_s):
+            raise ValueError("train_time_s must be finite")
+    elif project_full_session:
+        raise ValueError("full-session projections require train_time_s")
+
+
+def _decode_single_time(
+    trials: pl.DataFrame,
+    facemap_lf: pl.LazyFrame | pl.DataFrame,
+    *,
+    train_time_s: float,
+    features_to_use: int,
+    window_length: int,
+    sampling_rate: float,
+    project_full_session: bool,
+) -> dict[str, Any]:
+    """Fit one centered window per trial; retain full-fit and CV axes.
+
+    Projection columns are named by model_id. A fold model is held out only
+    for its excluded block, even though it can be evaluated on every frame.
+    """
+    facemap = _collect(facemap_lf.select("timestamps", "data"))
+    timestamps, data = _facemap_array(facemap, features_to_use=features_to_use)
+    offsets = (np.arange(window_length) - (window_length - 1) / 2) / sampling_rate
+    target_times = trials["stim_start_time"].to_numpy()[:, None] + train_time_s + offsets
+    if target_times.min() < timestamps[0] or target_times.max() > timestamps[-1]:
+        raise ValueError("requested training times fall outside the Facemap recording")
+    interpolator = interp1d(timestamps, data, axis=0, bounds_error=False, fill_value=np.nan)
+    X = interpolator(target_times).transpose(0, 2, 1).reshape(trials.height, -1)
+    if not np.isfinite(X).all():
+        raise ValueError("non-finite Facemap features at requested training times")
+    y = trials["is_response"].cast(pl.Int8).to_numpy()
+    groups = trials["block_index"].to_numpy()
+
+    axes = []
+    fold_scores = []
+    splits = list(LeaveOneGroupOut().split(X, y, groups))
+    fits = [("all_trials", None, np.arange(len(y)), None)] + [
+        (f"holdout_{fold}", int(groups[test[0]]), train, test)
+        for fold, (train, test) in enumerate(splits)
+    ]
+    for model_id, held_out_block, train, test in fits:
+        classifier = LinearSVC(
+            class_weight="balanced", max_iter=10_000, dual=True, random_state=0,
+        )
+        classifier.fit(X[train], y[train])
+        score = None
+        if test is not None:
+            score = float(balanced_accuracy_score(y[test], classifier.predict(X[test])))
+            fold_scores.append(score)
+        axes.append({
+            "model_id": model_id,
+            "held_out_block": held_out_block,
+            "feature_indices": np.repeat(np.arange(features_to_use), window_length).tolist(),
+            "sample_offsets_s": np.tile(offsets, features_to_use).tolist(),
+            "coefficients": classifier.coef_[0].tolist(),
+            "intercept": float(classifier.intercept_[0]),
+            "n_train_trials": int(len(train)),
+            "n_train_lick_trials": int(y[train].sum()),
+            "n_test_trials": 0 if test is None else int(len(test)),
+            "balanced_accuracy": score,
+        })
+
+    projections = None
+    if project_full_session:
+        # Keep native timestamps and duplicate rows. Boundaries without a
+        # complete window and non-finite inputs produce null scores. Chunking
+        # avoids allocating frames x features x window_length for a session.
+        frame_times = facemap["timestamps"].cast(pl.Float64).to_numpy()
+        raw_data = (
+            np.asarray(facemap["data"].to_list(), dtype=float)[:, :features_to_use]
+            if window_length == 1 else None
+        )
+        weights = np.asarray([axis["coefficients"] for axis in axes])
+        intercepts = np.asarray([axis["intercept"] for axis in axes])
+        values = np.full((facemap.height, len(axes)), np.nan)
+        for start in range(0, facemap.height, 4096):
+            stop = min(start + 4096, facemap.height)
+            times = frame_times[start:stop]
+            if window_length == 1:
+                frame_X = raw_data[start:stop]
+            else:
+                frame_X = interpolator(times[:, None] + offsets).transpose(0, 2, 1)
+                frame_X = frame_X.reshape(stop - start, -1)
+            valid = np.isfinite(times) & np.isfinite(frame_X).all(axis=1)
+            values[start:stop][valid] = frame_X[valid] @ weights.T + intercepts
+        projections = facemap.select("timestamps").with_row_index("frame_index")
+        projections = projections.with_columns([
+            pl.Series(axis["model_id"], values[:, i], nan_to_null=True)
+            for i, axis in enumerate(axes)
+        ])
+
+    mean_score = float(np.mean(fold_scores))
+    result = {
+        "train_time_s": train_time_s,
+        "cv_scores": [mean_score],
+        "window_start_s": [float(train_time_s + offsets[0])],
+        "window_end_s": [float(train_time_s + offsets[-1])],
+        "window_center_s": [train_time_s],
+        "cv_score_mean": mean_score,
+        "cv_score_max": mean_score,
+        "best_window_center_s": train_time_s,
+        "cv_folds": len(splits),
+        "decoder_axes": axes,
+    }
+    if projections is not None:
+        result["frame_projections"] = projections
+    return result
+
+
 def decode_session(
     trials: pl.DataFrame,
     facemap_lf: pl.LazyFrame | pl.DataFrame,
@@ -452,6 +569,8 @@ def decode_session(
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
     window_length: int = DEFAULT_WINDOW_LENGTH,
+    train_time_s: float | None = None,
+    project_full_session: bool = False,
 ) -> dict[str, Any]:
     """Decode one session and return its windowed CV scores.
 
@@ -460,9 +579,19 @@ def decode_session(
     accuracy scoring. Cross-validation leaves out one task block at a time,
     using the six ``block_index`` values as groups. When requested, each block
     contains equal numbers of lick and no-lick trials after deterministic
-    downsampling.
+    downsampling. Set ``train_time_s`` to fit one window centered at that exact
+    stimulus-relative time (linear interpolation, independent of ``window``).
+    ``window_length`` samples are spaced at ``sampling_rate`` and concatenated
+    in feature-major order. Returns ``decoder_axes`` for the full fit and each
+    CV fold. ``project_full_session=True`` additionally returns a
+    ``frame_projections`` DataFrame at original camera timestamps. Each column
+    is a model's decision score, ``X @ coefficients + intercept``, not a
+    probability. Only a fold's excluded block has held-out predictions.
     """
 
+    _validate_single_time_options(train_time_s, window_length, project_full_session)
+    if features_to_use < 1:
+        raise ValueError("features_to_use must be positive")
     _require_columns(
         trials,
         [
@@ -532,6 +661,13 @@ def decode_session(
             "each leave-one-block-out training split needs both lick and "
             "no-lick trials; the following held-out blocks leave one class "
             f"absent: {invalid_training_blocks['block_index'].to_list()}"
+        )
+
+    if train_time_s is not None:
+        return _decode_single_time(
+            decoding_trials, facemap_lf, train_time_s=train_time_s,
+            features_to_use=features_to_use, window_length=window_length,
+            sampling_rate=sampling_rate, project_full_session=project_full_session,
         )
 
     # Read the camera samples once per session.  Each condition is then
@@ -711,6 +847,25 @@ def _write_parquet_atomically(frame: pl.DataFrame, output_path: Path) -> None:
     temporary_path.replace(output_path)
 
 
+def _print_qc_exclusions(result: pl.DataFrame) -> None:
+    """Print a compact summary of sessions excluded by frame-gap QC."""
+
+    excluded = result.filter(pl.col("status").eq("excluded_qc")).select(
+        "session_id",
+        "facemap_n_frame_gaps",
+        "frame_gap_threshold_ms",
+    )
+    if excluded.is_empty():
+        return
+
+    print(f"Sessions excluded by frame-gap QC ({excluded.height}):")
+    for session_id, n_gaps, threshold_ms in excluded.iter_rows():
+        print(
+            f"  {session_id}: {n_gaps:,} frame intervals "
+            f"> {threshold_ms:g} ms"
+        )
+
+
 def _decode_one_session(
     index: int,
     session_id: str,
@@ -729,6 +884,8 @@ def _decode_one_session(
     features_to_use: int,
     sampling_rate: float,
     window_length: int,
+    train_time_s: float | None,
+    projection_dir: Path | None,
     fail_fast: bool,
     get_lf: Callable[..., pl.LazyFrame],
 ) -> dict[str, Any]:
@@ -751,6 +908,8 @@ def _decode_one_session(
         sampling_rate=sampling_rate,
         window_length=window_length,
     )
+    if train_time_s is not None:
+        row.update(train_time_s=train_time_s, decoder_axes=None, frame_projections_path=None)
 
     try:
         facemap_lf = get_lf(
@@ -785,19 +944,28 @@ def _decode_one_session(
                     best_window_center_s=None,
                 )
                 return row
-        row.update(
-            decode_session(
-                session_trials,
-                facemap_lf,
-                stimulus_modality=stimulus_modality,
-                target_trials_only=target_trials_only,
-                balance_trials_across_blocks=balance_trials_across_blocks,
-                window=window,
-                features_to_use=features_to_use,
-                sampling_rate=sampling_rate,
-                window_length=window_length,
-            )
+        decoded = decode_session(
+            session_trials,
+            facemap_lf,
+            stimulus_modality=stimulus_modality,
+            target_trials_only=target_trials_only,
+            balance_trials_across_blocks=balance_trials_across_blocks,
+            window=window,
+            features_to_use=features_to_use,
+            sampling_rate=sampling_rate,
+            window_length=window_length,
+            train_time_s=train_time_s,
+            project_full_session=projection_dir is not None,
         )
+        projections = decoded.pop("frame_projections", None)
+        if projections is not None:
+            projection_path = projection_dir / f"session-{index:06d}.parquet"
+            _write_parquet_atomically(
+                projections.with_columns(pl.lit(session_id).alias("session_id")),
+                projection_path,
+            )
+            decoded["frame_projections_path"] = str(projection_path.resolve())
+        row.update(decoded)
     except Exception as exc:  # one problematic session should not stop a batch
         if fail_fast:
             raise
@@ -836,6 +1004,8 @@ def decode_all_sessions(
     features_to_use: int = DEFAULT_FEATURES,
     sampling_rate: float = DEFAULT_SAMPLING_RATE,
     window_length: int = DEFAULT_WINDOW_LENGTH,
+    train_time_s: float | None = None,
+    projection_dir: str | Path | None = None,
     fail_fast: bool = False,
     parallelize_sessions: bool = False,
     max_workers: int | None = None,
@@ -876,6 +1046,18 @@ def decode_all_sessions(
         If true, downsample the larger response class within each block so
         every block has equal lick and no-lick trial counts. The sample is
         deterministic.
+    train_time_s:
+        Fit one window centered at this exact time relative to stimulus onset,
+        independent of the capture window. Uses ``window_length`` samples
+        spaced at ``sampling_rate``; one sample fits an instantaneous axis.
+        Saves full-fit and leave-one-block-out coefficients and intercepts
+        in the ``decoder_axes`` column. None retains sliding-window decoding.
+    projection_dir:
+        If supplied with ``train_time_s``, save full-session frame scores for
+        every model to one Parquet file per session in a unique run subdirectory.
+        The result's ``frame_projections_path`` points to that file. Scores
+        include the intercept and are not probabilities. Fold scores are
+        held out only for trials in that model's excluded block.
     frame_gap_threshold_s:
         Facemap frame intervals longer than this duration are counted as QC
         gaps. The default is 0.025 seconds (25 ms).
@@ -897,6 +1079,7 @@ def decode_all_sessions(
         custom loader must be picklable when ``parallelize_sessions`` is true.
     """
 
+    _validate_single_time_options(train_time_s, window_length, projection_dir is not None)
     if frame_gap_threshold_s <= 0:
         raise ValueError("frame_gap_threshold_s must be positive")
     if max_frame_gaps is not None and max_frame_gaps < 0:
@@ -959,6 +1142,11 @@ def decode_all_sessions(
     if checkpoint is not None:
         LOGGER.info("Writing per-session checkpoints to %s", checkpoint)
 
+    projection_run = None
+    if projection_dir is not None:
+        projection_run = Path(projection_dir).resolve() / uuid4().hex
+        projection_run.mkdir(parents=True, exist_ok=False)
+
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be at least one")
 
@@ -1007,6 +1195,8 @@ def decode_all_sessions(
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
                         window_length=window_length,
+                        train_time_s=train_time_s,
+                        projection_dir=projection_run,
                         fail_fast=fail_fast,
                         get_lf=get_lf,
                     ): (index, session_id)
@@ -1042,13 +1232,18 @@ def decode_all_sessions(
                         features_to_use=features_to_use,
                         sampling_rate=sampling_rate,
                         window_length=window_length,
+                        train_time_s=train_time_s,
+                        projection_dir=projection_run,
                         fail_fast=fail_fast,
                         get_lf=get_lf,
                     ),
                 )
                 progress.update(1)
 
-    result = pl.DataFrame([row for row in rows if row is not None])
+    # A long initial run of failed/QC-excluded sessions has null axes; infer
+    # from every row so later successful sessions retain their nested schema.
+    result = pl.DataFrame([row for row in rows if row is not None], infer_schema_length=None)
+    _print_qc_exclusions(result)
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         _write_parquet_atomically(result, output)
@@ -1079,11 +1274,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_window,
         default=DEFAULT_WINDOW,
         metavar="START,END",
-        help="stimulus-aligned capture window in seconds (default: -1,1)",
+        help="stimulus-aligned capture window in seconds (default: %(default)s)",
     )
     parser.add_argument("--features", type=int, default=DEFAULT_FEATURES)
     parser.add_argument("--sampling-rate", type=float, default=DEFAULT_SAMPLING_RATE)
     parser.add_argument("--window-length", type=int, default=DEFAULT_WINDOW_LENGTH)
+    parser.add_argument(
+        "--train-time", type=float, default=None, metavar="SECONDS",
+        help="train one window centered at this stimulus-relative time in seconds",
+    )
+    parser.add_argument(
+        "--projection-dir", type=Path, default=None,
+        help="save full-session scores for all fitted axes here; requires --train-time",
+    )
     parser.add_argument(
         "--stimulus-modality",
         choices=("visual", "auditory"),
@@ -1157,6 +1360,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         features_to_use=args.features,
         sampling_rate=args.sampling_rate,
         window_length=args.window_length,
+        train_time_s=args.train_time,
+        projection_dir=args.projection_dir,
         fail_fast=args.fail_fast,
         parallelize_sessions=args.parallelize_sessions,
         max_workers=args.max_workers,
