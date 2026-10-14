@@ -460,18 +460,25 @@ def _decode_single_time(
     facemap_lf: pl.LazyFrame | pl.DataFrame,
     *,
     train_time_s: float,
+    window: tuple[float, float],
     features_to_use: int,
     window_length: int,
     sampling_rate: float,
     project_full_session: bool,
 ) -> dict[str, Any]:
-    """Fit one centered window per trial; retain full-fit and CV axes.
+    """Fit one centered window and evaluate its CV axes across ``window``.
 
     Projection columns are named by model_id. A fold model is held out only
     for its excluded block, even though it can be evaluated on every frame.
     """
     facemap = _collect(facemap_lf.select("timestamps", "data"))
     timestamps, data = _facemap_array(facemap, features_to_use=features_to_use)
+    n_samples = int(round((window[1] - window[0]) * sampling_rate))
+    if window_length > n_samples:
+        raise ValueError(
+            f"window_length ({window_length}) exceeds the {n_samples} samples "
+            "in the capture window"
+        )
     offsets = (np.arange(window_length) - (window_length - 1) / 2) / sampling_rate
     target_times = trials["stim_start_time"].to_numpy()[:, None] + train_time_s + offsets
     if target_times.min() < timestamps[0] or target_times.max() > timestamps[-1]:
@@ -484,7 +491,8 @@ def _decode_single_time(
     groups = trials["block_index"].to_numpy()
 
     axes = []
-    fold_scores = []
+    fold_models: list[tuple[LinearSVC, np.ndarray]] = []
+    training_fold_scores = []
     splits = list(LeaveOneGroupOut().split(X, y, groups))
     fits = [("all_trials", None, np.arange(len(y)), None)] + [
         (f"holdout_{fold}", int(groups[test[0]]), train, test)
@@ -498,7 +506,8 @@ def _decode_single_time(
         score = None
         if test is not None:
             score = float(balanced_accuracy_score(y[test], classifier.predict(X[test])))
-            fold_scores.append(score)
+            training_fold_scores.append(score)
+            fold_models.append((classifier, test))
         axes.append({
             "model_id": model_id,
             "held_out_block": held_out_block,
@@ -511,6 +520,45 @@ def _decode_single_time(
             "n_test_trials": 0 if test is None else int(len(test)),
             "balanced_accuracy": score,
         })
+
+    # Apply each fold's fixed axis to its held-out trials at every window.
+    # This is temporal generalization, not a new fit at every time point.
+    evaluation_times = window[0] + np.arange(n_samples) / sampling_rate
+    evaluation_target_times = (
+        trials["stim_start_time"].to_numpy()[:, None] + evaluation_times
+    )
+    evaluation_interpolator = interp1d(
+        timestamps,
+        data,
+        axis=0,
+        bounds_error=False,
+        # Match sliding-window decoding for trials near recording boundaries.
+        fill_value=(data[0], data[-1]),
+    )
+    evaluation_data = evaluation_interpolator(evaluation_target_times).transpose(
+        0, 2, 1
+    )
+    if not np.isfinite(evaluation_data).all():
+        raise ValueError("non-finite Facemap features in the evaluation window")
+
+    scores: list[float] = []
+    for window_start in range(n_samples - window_length + 1):
+        evaluation_X = evaluation_data[
+            :, :, window_start : window_start + window_length
+        ].reshape(trials.height, -1)
+        evaluation_fold_scores = [
+            balanced_accuracy_score(
+                y[test], classifier.predict(evaluation_X[test])
+            )
+            for classifier, test in fold_models
+        ]
+        scores.append(float(np.mean(evaluation_fold_scores)))
+
+    window_starts = window[0] + np.arange(len(scores)) / sampling_rate
+    # These are the actual first/last sample times. For a one-sample decoder,
+    # all three time arrays coincide.
+    window_ends = window_starts + (window_length - 1) / sampling_rate
+    window_centers = (window_starts + window_ends) / 2
 
     projections = None
     if project_full_session:
@@ -541,16 +589,17 @@ def _decode_single_time(
             for i, axis in enumerate(axes)
         ])
 
-    mean_score = float(np.mean(fold_scores))
+    train_cv_score = float(np.mean(training_fold_scores))
     result = {
         "train_time_s": train_time_s,
-        "cv_scores": [mean_score],
-        "window_start_s": [float(train_time_s + offsets[0])],
-        "window_end_s": [float(train_time_s + offsets[-1])],
-        "window_center_s": [train_time_s],
-        "cv_score_mean": mean_score,
-        "cv_score_max": mean_score,
-        "best_window_center_s": train_time_s,
+        "train_cv_score": train_cv_score,
+        "cv_scores": scores,
+        "window_start_s": window_starts.tolist(),
+        "window_end_s": window_ends.tolist(),
+        "window_center_s": window_centers.tolist(),
+        "cv_score_mean": float(np.mean(scores)),
+        "cv_score_max": float(np.max(scores)),
+        "best_window_center_s": float(window_centers[int(np.argmax(scores))]),
         "cv_folds": len(splits),
         "decoder_axes": axes,
     }
@@ -584,7 +633,9 @@ def decode_session(
     stimulus-relative time (linear interpolation, independent of ``window``).
     ``window_length`` samples are spaced at ``sampling_rate`` and concatenated
     in feature-major order. Returns ``decoder_axes`` for the full fit and each
-    CV fold. ``project_full_session=True`` additionally returns a
+    CV fold, then applies each fold axis to its held-out trials across
+    ``window`` to produce a temporal-generalization ``cv_scores`` curve.
+    ``project_full_session=True`` additionally returns a
     ``frame_projections`` DataFrame at original camera timestamps. Each column
     is a model's decision score, ``X @ coefficients + intercept``, not a
     probability. Only a fold's excluded block has held-out predictions.
@@ -667,6 +718,7 @@ def decode_session(
     if train_time_s is not None:
         return _decode_single_time(
             decoding_trials, facemap_lf, train_time_s=train_time_s,
+            window=window,
             features_to_use=features_to_use, window_length=window_length,
             sampling_rate=sampling_rate, project_full_session=project_full_session,
         )
@@ -910,7 +962,12 @@ def _decode_one_session(
         window_length=window_length,
     )
     if train_time_s is not None:
-        row.update(train_time_s=train_time_s, decoder_axes=None, frame_projections_path=None)
+        row.update(
+            train_time_s=train_time_s,
+            train_cv_score=None,
+            decoder_axes=None,
+            frame_projections_path=None,
+        )
 
     try:
         facemap_lf = get_lf(
@@ -1053,7 +1110,9 @@ def decode_all_sessions(
         independent of the capture window. Uses ``window_length`` samples
         spaced at ``sampling_rate``; one sample fits an instantaneous axis.
         Saves full-fit and leave-one-block-out coefficients and intercepts
-        in the ``decoder_axes`` column. None retains sliding-window decoding.
+        in the ``decoder_axes`` column, and evaluates each fixed fold axis on
+        held-out trials across the capture window. None retains sliding-window
+        decoding, which refits the classifier at every window.
     projection_dir:
         If supplied with ``train_time_s``, save full-session frame scores for
         every model to one Parquet file per session in a unique run subdirectory.
@@ -1283,7 +1342,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window-length", type=int, default=DEFAULT_WINDOW_LENGTH)
     parser.add_argument(
         "--train-time", type=float, default=None, metavar="SECONDS",
-        help="train one window centered at this stimulus-relative time in seconds",
+        help=(
+            "train one window at this stimulus-relative time, then evaluate "
+            "the fixed decoder across --window"
+        ),
     )
     parser.add_argument(
         "--projection-dir", type=Path, default=None,

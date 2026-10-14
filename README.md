@@ -125,13 +125,16 @@ sliding-window decoder, rather than averaged. Fixed-time training is independent
 of `--window`; it can train at 0.5 s even though the default capture interval
 ends there. All requested training samples must lie within the camera recording.
 
-The session results retain a one-element `cv_scores` list containing mean
-leave-one-block-out balanced accuracy at the selected window. In this mode,
-`window_start_s` and `window_end_s` record the first and last sample times,
-and `window_center_s` records the requested center. They coincide for one sample.
+The decoder is fit only at `train_time_s`, then each leave-one-block-out model
+is applied to its held-out trials across the full `--window`. The resulting
+`cv_scores` list is therefore a temporal-generalization curve: every entry is
+the mean held-out balanced accuracy of the same fixed decoder axes, not a model
+refit at that time. `window_start_s`, `window_end_s`, and `window_center_s`
+describe the evaluation windows and coincide for a one-sample decoder.
 The following additional fields are saved:
 
 - `train_time_s`: the requested stimulus-relative window center.
+- `train_cv_score`: mean held-out balanced accuracy at the exact training time.
 - `decoder_axes`: one entry for `all_trials` and one per CV fold (`holdout_0`,
   `holdout_1`, etc.). Each entry contains `model_id`, `held_out_block`,
   `feature_indices`, `sample_offsets_s`, `coefficients`, `intercept`, training
@@ -170,6 +173,14 @@ trials in the block identified by that axis's `held_out_block`**. Choose that
 column when analyzing that block; the fold number need not equal the block index.
 The score columns are kept separate to preserve which axis generated each value.
 Filtering and balancing affect model training, not which camera frames are saved.
+
+For example, with the default `[-0.25, 0.5)` capture window, 60 Hz sampling,
+and a one-sample decoder, the output curve has 45 scores spanning -0.25 s
+through 0.4833 s. A multi-sample decoder has fewer evaluation windows because
+all of its samples must fit inside the capture window. `cv_score_mean`,
+`cv_score_max`, and `best_window_center_s` summarize this full curve; use
+`train_cv_score` for performance at the fixed training time. The training time
+does not need to fall inside the evaluation window.
 
 Read the frames and reconstruct a coefficient matrix with:
 

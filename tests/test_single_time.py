@@ -42,16 +42,20 @@ class SingleTimeTests(unittest.TestCase):
         times = facemap["timestamps"].to_numpy()
         data = np.asarray(facemap["data"].to_list())
         interpolate = interp1d(times, data, axis=0)
+        evaluation_window = (-0.2, 0.8)
         for length in (1, 3, 4):
             with self.subTest(window_length=length):
                 result = decode_session(
                     trials, facemap.lazy(), features_to_use=2,
                     train_time_s=0.5, window_length=length, sampling_rate=10,
-                    project_full_session=True,
+                    window=evaluation_window, project_full_session=True,
                 )
-                self.assertEqual(len(result["cv_scores"]), 1)
+                n_samples = round(
+                    (evaluation_window[1] - evaluation_window[0]) * 10
+                )
+                self.assertEqual(len(result["cv_scores"]), n_samples - length + 1)
                 self.assertEqual(result["cv_folds"], 3)
-                self.assertGreater(result["cv_scores"][0], 0.9)
+                self.assertGreater(result["train_cv_score"], 0.9)
                 self.assertEqual(len(result["decoder_axes"]), 4)
                 offsets = (np.arange(length) - (length - 1) / 2) / 10
                 target = trials["stim_start_time"].to_numpy()[:, None] + 0.5 + offsets
@@ -78,6 +82,67 @@ class SingleTimeTests(unittest.TestCase):
                 if length > 1:
                     self.assertIsNone(frames["all_trials"][0])
                     self.assertIsNone(frames["all_trials"][-1])
+
+    def test_fixed_axis_is_scored_across_the_capture_window(self):
+        trials, facemap = fixture()
+        window = (-0.2, 0.8)
+        sampling_rate = 10
+        window_length = 3
+        result = decode_session(
+            trials,
+            facemap,
+            features_to_use=2,
+            train_time_s=0.5,
+            window=window,
+            window_length=window_length,
+            sampling_rate=sampling_rate,
+        )
+
+        times = facemap["timestamps"].to_numpy()
+        data = np.asarray(facemap["data"].to_list())
+        interpolate = interp1d(times, data, axis=0)
+        n_samples = round((window[1] - window[0]) * sampling_rate)
+        relative_times = window[0] + np.arange(n_samples) / sampling_rate
+        target_times = (
+            trials["stim_start_time"].to_numpy()[:, None] + relative_times
+        )
+        evaluation_data = interpolate(target_times).transpose(0, 2, 1)
+        y = trials["is_response"].cast(pl.Int8).to_numpy()
+        groups = trials["block_index"].to_numpy()
+        expected_scores = []
+        for start in range(n_samples - window_length + 1):
+            X = evaluation_data[:, :, start : start + window_length].reshape(
+                trials.height, -1
+            )
+            fold_scores = []
+            for axis in result["decoder_axes"][1:]:
+                test = groups == axis["held_out_block"]
+                predictions = (
+                    X[test] @ np.asarray(axis["coefficients"]) + axis["intercept"]
+                ) > 0
+                fold_scores.append(
+                    ((predictions[y[test] == 1]).mean()
+                     + (~predictions[y[test] == 0]).mean()) / 2
+                )
+            expected_scores.append(np.mean(fold_scores))
+
+        expected_starts = window[0] + np.arange(len(expected_scores)) / sampling_rate
+        expected_ends = expected_starts + (window_length - 1) / sampling_rate
+        np.testing.assert_allclose(result["cv_scores"], expected_scores)
+        np.testing.assert_allclose(result["window_start_s"], expected_starts)
+        np.testing.assert_allclose(result["window_end_s"], expected_ends)
+        np.testing.assert_allclose(
+            result["window_center_s"], (expected_starts + expected_ends) / 2
+        )
+        train_index = int(np.argmin(np.abs(np.asarray(result["window_center_s"]) - 0.5)))
+        self.assertAlmostEqual(result["window_center_s"][train_index], 0.5)
+        self.assertAlmostEqual(result["cv_scores"][train_index], result["train_cv_score"])
+        self.assertAlmostEqual(
+            result["train_cv_score"],
+            np.mean([
+                axis["balanced_accuracy"] for axis in result["decoder_axes"][1:]
+            ]),
+        )
 
     def test_held_out_labels_do_not_change_fold_axis(self):
         trials, facemap = fixture()
@@ -144,6 +209,9 @@ class SingleTimeTests(unittest.TestCase):
                 saved = pl.read_parquet(root / "results.parquet")
                 row = saved.filter(pl.col("session_id") == "good").to_dicts()[0]
                 self.assertEqual(len(row["decoder_axes"]), 4)
+                self.assertGreater(row["train_cv_score"], 0.9)
+                self.assertEqual(len(row["cv_scores"]), 5)
+                self.assertEqual(len(row["window_center_s"]), 5)
                 self.assertEqual(Path(row["frame_projections_path"]).name, "good.parquet")
                 frames = pl.read_parquet(row["frame_projections_path"])
                 self.assertEqual(frames.height, fixture()[1].height)
